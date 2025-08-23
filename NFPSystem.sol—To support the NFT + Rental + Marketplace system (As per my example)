@@ -1,0 +1,265 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+/**
+ * 🔹 NFPSystem.sol
+ * รวมสัญญาทั้งหมดในไฟล์เดียว สำหรับทดสอบใน Remix
+ *
+ * Contracts:
+ * - NFPRegistry: ลงทะเบียนผลงาน/เมตาดาต้า
+ * - NFP721: NFT ERC721 (กรรมสิทธิ์)
+ * - NFPRenter: ให้เช่า/สิทธิ์เข้าถึงชั่วคราว พร้อมระบบจ่าย USDC
+ * - NFPMarketplace: ลิสต์ขาย/เช่า/ประมูล พร้อมระบบจ่าย USDC และโอน NFT
+ * - NFPAccessController: ตรวจสอบสิทธิ์การเข้าถึง
+ * - NFP1155Chapters: สำหรับบท/ตอนย่อย (ERC1155)
+ */
+
+import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
+import "@openzeppelin/contracts/token/common/ERC2981.sol";
+import "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/Counters.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+/// ---------------------------
+/// 1) NFPRegistry
+/// ---------------------------
+contract NFPRegistry {
+    struct Work {
+        string metadataURI;
+        address creator;
+        bool exists;
+    }
+
+    mapping(uint256 => Work) public works;
+    uint256 public workCounter;
+
+    event WorkRegistered(uint256 workId, address creator, string metadataURI);
+
+    function registerWork(string memory metadataURI) external returns (uint256) {
+        workCounter++;
+        works[workCounter] = Work(metadataURI, msg.sender, true);
+        emit WorkRegistered(workCounter, msg.sender, metadataURI);
+        return workCounter;
+    }
+}
+
+/// ---------------------------
+/// 2) NFP721 (ERC721 + ERC2981)
+/// ---------------------------
+contract NFP721 is ERC721URIStorage, ERC2981, AccessControl {
+    using Counters for Counters.Counter;
+    Counters.Counter private _tokenIds;
+
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+
+    constructor() ERC721("NFP721", "NFP") {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(MINTER_ROLE, msg.sender);
+    }
+
+    function mint(address to, string memory tokenURI, address royaltyReceiver, uint96 feeNumerator)
+        external
+        onlyRole(MINTER_ROLE)
+        returns (uint256)
+    {
+        _tokenIds.increment();
+        uint256 newItemId = _tokenIds.current();
+        _mint(to, newItemId);
+        _setTokenURI(newItemId, tokenURI);
+        _setTokenRoyalty(newItemId, royaltyReceiver, feeNumerator);
+        return newItemId;
+    }
+
+    /// required override
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(ERC721URIStorage, ERC2981, AccessControl)
+        returns (bool)
+    {
+        return super.supportsInterface(interfaceId);
+    }
+}
+
+/// ---------------------------
+/// 3) NFPRenter (มีระบบจ่ายค่าเช่าผ่าน USDC)
+/// ---------------------------
+contract NFPRenter is AccessControl {
+    IERC20 public paymentToken;  // เช่น USDC
+    uint256 public rentPricePerSecond;
+
+    struct RentInfo {
+        address renter;
+        uint256 expiry;
+    }
+
+    mapping(uint256 => RentInfo) public rentals;
+
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+
+    event Rented(uint256 tokenId, address renter, uint256 expiry);
+
+    constructor(address _paymentToken, uint256 _rentPricePerSecond) {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(ADMIN_ROLE, msg.sender);
+
+        paymentToken = IERC20(_paymentToken);
+        rentPricePerSecond = _rentPricePerSecond;
+    }
+
+    function setRentPricePerSecond(uint256 _price) external onlyRole(ADMIN_ROLE) {
+        rentPricePerSecond = _price;
+    }
+
+    function rent(uint256 tokenId, uint256 duration) external {
+        require(duration > 0, "Invalid duration");
+
+        uint256 totalPrice = rentPricePerSecond * duration;
+
+        // ผู้เช่า ต้อง approve usdc ก่อนแล้ว contract จะดึงจ่ายตรงนี้
+        require(paymentToken.transferFrom(msg.sender, address(this), totalPrice), "Payment failed");
+
+        rentals[tokenId] = RentInfo(msg.sender, block.timestamp + duration);
+
+        emit Rented(tokenId, msg.sender, block.timestamp + duration);
+    }
+
+    function isRenter(uint256 tokenId, address user) public view returns (bool) {
+        return rentals[tokenId].renter == user && rentals[tokenId].expiry > block.timestamp;
+    }
+
+    // ฟังก์ชันให้ Admin ถอน USDC ออก (กรณีต้องการเบิก)
+    function withdrawPayments(address to, uint256 amount) external onlyRole(ADMIN_ROLE) {
+        require(paymentToken.transfer(to, amount), "Withdraw failed");
+    }
+}
+
+/// ---------------------------
+/// 4) NFPMarketplace (มีระบบจ่าย USDC และโอน NFT ใน purchase)
+/// ---------------------------
+contract NFPMarketplace is ReentrancyGuard, AccessControl {
+    using Counters for Counters.Counter;
+    enum ListingType { Sale, Rent, Auction }
+
+    struct Listing {
+        address owner;
+        uint256 tokenId;
+        uint256 price;
+        ListingType listingType;
+        bool active;
+    }
+
+    mapping(uint256 => Listing) public listings;
+    Counters.Counter public listingCounter;
+
+    IERC20 public usdcToken;
+    NFP721 public nfp721;
+
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+
+    event Listed(uint256 listingId, address owner, uint256 tokenId, uint256 price, ListingType listingType);
+    event Purchased(uint256 listingId, address buyer);
+
+    constructor(address _usdcToken, address _nfp721) {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(ADMIN_ROLE, msg.sender);
+
+        usdcToken = IERC20(_usdcToken);
+        nfp721 = NFP721(_nfp721);
+    }
+
+    function setUSDC(address _usdcToken) external onlyRole(ADMIN_ROLE) {
+        usdcToken = IERC20(_usdcToken);
+    }
+
+    function setNFP721(address _nfp721) external onlyRole(ADMIN_ROLE) {
+        nfp721 = NFP721(_nfp721);
+    }
+
+    function list(uint256 tokenId, uint256 price, ListingType listingType) external returns (uint256) {
+        // เจ้าของต้องเป็นผู้เรียกฟังก์ชันนี้
+        require(nfp721.ownerOf(tokenId) == msg.sender, "Not token owner");
+        require(price > 0, "Price must be > 0");
+
+        listingCounter.increment();
+        uint256 currentId = listingCounter.current();
+
+        listings[currentId] = Listing(msg.sender, tokenId, price, listingType, true);
+
+        emit Listed(currentId, msg.sender, tokenId, price, listingType);
+        return currentId;
+    }
+
+    function purchase(uint256 listingId) external nonReentrant {
+        Listing storage l = listings[listingId];
+        require(l.active, "Listing inactive");
+        require(l.listingType == ListingType.Sale, "Not sale");
+
+        address owner = nfp721.ownerOf(l.tokenId);
+        require(owner == l.owner, "Seller not owner");
+
+        // รับชำระเงิน USDC จากผู้ซื้อ (ต้อง approve ก่อนเรียก)
+        require(usdcToken.transferFrom(msg.sender, l.owner, l.price), "Payment failed");
+
+        // โอน NFT ไปผู้ซื้อ
+        nfp721.safeTransferFrom(owner, msg.sender, l.tokenId);
+
+        l.active = false;
+        emit Purchased(listingId, msg.sender);
+    }
+}
+
+/// ---------------------------
+/// 5) NFPAccessController
+/// ---------------------------
+contract NFPAccessController {
+    NFP721 public nfp721;
+    NFPRenter public renter;
+
+    constructor(address _nfp721, address _renter) {
+        nfp721 = NFP721(_nfp721);
+        renter = NFPRenter(_renter);
+    }
+
+    function hasAccess(uint256 tokenId, address user) external view returns (bool) {
+        if (nfp721.ownerOf(tokenId) == user) return true;
+        if (renter.isRenter(tokenId, user)) return true;
+        return false;
+    }
+}
+
+/// ---------------------------
+/// 6) NFP1155Chapters
+/// ---------------------------
+contract NFP1155Chapters is ERC1155, AccessControl {
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+
+    constructor(string memory uri) ERC1155(uri) {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(MINTER_ROLE, msg.sender);
+    }
+
+    function mint(address to, uint256 id, uint256 amount, bytes memory data) public onlyRole(MINTER_ROLE) {
+        _mint(to, id, amount, data);
+    }
+
+    function mintBatch(address to, uint256[] memory ids, uint256[] memory amounts, bytes memory data)
+        public
+        onlyRole(MINTER_ROLE)
+    {
+        _mintBatch(to, ids, amounts, data);
+    }
+
+    /// ✅ แก้ error supportsInterface
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(ERC1155, AccessControl)
+        returns (bool)
+    {
+        return super.supportsInterface(interfaceId);
+    }
+}
